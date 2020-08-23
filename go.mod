@@ -1,4 +1,4 @@
-module git.ocjtech.us/jeff/go-homeassistant
+module github.com/jcollie/go-homeassistant
 
 go 1.14
 
