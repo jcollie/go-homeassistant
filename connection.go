@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	"github.com/gorilla/websocket"
 	"github.com/pkg/errors"
 )
@@ -14,132 +15,34 @@ import (
 // Connection .
 type Connection struct {
 	sync.RWMutex
-	conn     *websocket.Conn
-	handlers map[uint64]interface{}
-	lastID   uint64
-	Done     chan struct{}
+	hostname    string
+	port        int
+	accessToken string
+	secure      bool
+	conn        *websocket.Conn
+	handlers    map[uint64]interface{}
+	lastID      uint64
+	Done        chan struct{}
 }
 
 // NewConnection .
 func NewConnection(hostname string, port int, accessToken string, secure bool) (*Connection, error) {
 	ha := new(Connection)
-
+	ha.hostname = hostname
+	ha.port = port
+	ha.accessToken = accessToken
+	ha.secure = secure
 	ha.handlers = make(map[uint64]interface{})
 
-	var u url.URL
-	if secure {
-		u.Scheme = "wss"
-	} else {
-		u.Scheme = "ws"
-	}
-	u.Host = hostname
-	if port == 0 {
-		u.Host = hostname
-	} else {
-		u.Host = fmt.Sprintf("%s:%d", hostname, port)
-	}
-	u.Path = "/api/websocket"
-
 	go func() {
-
 		for {
-			var err error
-			ha.Lock()
-			authenticated := false
-
-			for !authenticated {
-
-				var message Message
-				ha.conn, _, err = websocket.DefaultDialer.Dial(u.String(), nil)
-				if err != nil {
-					log.Fatal("dial:", err)
-				}
-
-				authenticated = func() bool {
-					for {
-						err := ha.conn.ReadJSON(&message)
-						if err != nil {
-							if ce, ok := err.(*websocket.CloseError); ok {
-								switch ce.Code {
-								case websocket.CloseNormalClosure,
-									websocket.CloseGoingAway,
-									websocket.CloseNoStatusReceived:
-									fmt.Printf("connection was closed\n")
-									return false
-								}
-							} else {
-								fmt.Printf("err: %+v\n", err)
-								return false
-							}
-
-						}
-
-						switch message.Type {
-						case "auth_required":
-							var message = struct {
-								Type        string `json:"type"`
-								AccessToken string `json:"access_token"`
-							}{
-								Type:        "auth",
-								AccessToken: accessToken,
-							}
-
-							err = ha.conn.WriteJSON(&message)
-							if err != nil {
-								log.Fatal("write:", err)
-							}
-
-						case "auth_ok":
-							log.Printf("authenticated")
-							return true
-
-						case "auth_invalid":
-							ha.conn.Close()
-							log.Printf("authentication failed")
-							return false
-						}
-					}
-				}()
-				if !authenticated {
-                    fmt.Printf("not authenticated, sleeping")
-					time.Sleep(30 * time.Second)
-				}
+			err := backoff.Retry(ha.connectAndAuthenticate, backoff.NewExponentialBackOff())
+			if err != nil {
+				log.Printf("%+v\n", err)
+				return
 			}
-			ha.Unlock()
-			closed := false
 
-			for !closed {
-				var message Message
-				err := ha.conn.ReadJSON(&message)
-				if err != nil {
-					if ce, ok := err.(*websocket.CloseError); ok {
-						switch ce.Code {
-						case websocket.CloseNormalClosure,
-							websocket.CloseGoingAway,
-							websocket.CloseNoStatusReceived:
-							fmt.Printf("CLOSED!\n")
-							closed = true
-						}
-					}
-					fmt.Printf("")
-					closed = true
-				} else {
-					switch message.Type {
-					case "result":
-						ha.handleResult(message)
-
-					case "event":
-						ha.handleEvent(message)
-
-					case "pong":
-						ha.handlePong(message)
-						log.Printf("pong\n")
-
-					default:
-						log.Printf("unkown message type '%s'", message.Type)
-					}
-				}
-			}
+			ha.readMessages()
 
 			ha.Lock()
 			for id, handler := range ha.handlers {
@@ -148,13 +51,119 @@ func NewConnection(hostname string, port int, accessToken string, secure bool) (
 			}
 			ha.conn = nil
 			ha.Unlock()
-
-			log.Printf("sleeping 15 seconds")
-			time.Sleep(15 * time.Second)
 		}
 	}()
 
 	return ha, nil
+}
+
+func (ha *Connection) connectAndAuthenticate() error {
+	ha.Lock()
+	defer ha.Unlock()
+
+	var err error
+
+	var u url.URL
+	if ha.secure {
+		u.Scheme = "wss"
+	} else {
+		u.Scheme = "ws"
+	}
+	u.Host = ha.hostname
+	if ha.port == 0 {
+		u.Host = ha.hostname
+	} else {
+		u.Host = fmt.Sprintf("%s:%d", ha.hostname, ha.port)
+	}
+	u.Path = "/api/websocket"
+
+	log.Printf("attempting to connect")
+
+	ha.conn, _, err = websocket.DefaultDialer.Dial(u.String(), nil)
+	if err != nil {
+		return errors.Wrap(err, "unable to connect")
+	}
+
+	for {
+		var message Message
+		err := ha.conn.ReadJSON(&message)
+		if err != nil {
+			if ce, ok := err.(*websocket.CloseError); ok {
+				switch ce.Code {
+				case websocket.CloseNormalClosure,
+					websocket.CloseGoingAway,
+					websocket.CloseNoStatusReceived:
+					return errors.Wrap(err, "connection closed")
+				default:
+					return errors.Wrap(err, "some other connection closed error")
+				}
+			} else {
+				return errors.Wrap(err, "problem reading message")
+			}
+
+		}
+
+		switch message.Type {
+		case "auth_required":
+			var message = struct {
+				Type        string `json:"type"`
+				AccessToken string `json:"access_token"`
+			}{
+				Type:        "auth",
+				AccessToken: ha.accessToken,
+			}
+
+			err = ha.conn.WriteJSON(&message)
+			if err != nil {
+				return errors.Wrap(err, "unable to write")
+			}
+
+		case "auth_ok":
+			log.Printf("authenticated")
+			return nil
+
+		case "auth_invalid":
+			ha.conn.Close()
+			log.Printf("authentication failed")
+			return errors.Errorf("authentication failed")
+		}
+	}
+
+}
+
+func (ha *Connection) readMessages() {
+	for {
+		var message Message
+		err := ha.conn.ReadJSON(&message)
+		if err != nil {
+			if ce, ok := err.(*websocket.CloseError); ok {
+				switch ce.Code {
+				case websocket.CloseNormalClosure,
+					websocket.CloseGoingAway,
+					websocket.CloseNoStatusReceived:
+					log.Printf("CLOSED!")
+					return
+				}
+			}
+			log.Printf("read error: %+v", err)
+			return
+		}
+
+		switch message.Type {
+		case "result":
+			ha.handleResult(message)
+
+		case "event":
+			ha.handleEvent(message)
+
+		case "pong":
+			ha.handlePong(message)
+			log.Printf("pong\n")
+
+		default:
+			log.Printf("unkown message type '%s'", message.Type)
+		}
+	}
 }
 
 func (ha *Connection) sendMessage(handler interface{}, message Command) (uint64, error) {
@@ -185,7 +194,6 @@ func (ha *Connection) sendMessage(handler interface{}, message Command) (uint64,
 // RemoveHandler .
 func (ha *Connection) RemoveHandler(id uint64) {
 	ha.Lock()
-
 	defer ha.Unlock()
 	delete(ha.handlers, id)
 }
@@ -198,7 +206,8 @@ func (ha *Connection) Close() {
 		websocket.CloseMessage,
 		websocket.FormatCloseMessage(
 			websocket.CloseNormalClosure,
-			""),
+			"",
+		),
 	)
 	ha.Unlock()
 	if err != nil {
