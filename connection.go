@@ -77,14 +77,16 @@ func (ha *Connection) connectAndAuthenticate() error {
 	}
 	u.Path = "/api/websocket"
 
-	log.Printf("attempting to connect")
+	log.Printf("attempting to connect to %s", u.String())
 
 	ha.conn, _, err = websocket.DefaultDialer.Dial(u.String(), nil)
 	if err != nil {
+		log.Printf("****** %+v", err)
 		return errors.Wrap(err, "unable to connect")
 	}
 
 	for {
+		log.Printf("****** about to read message")
 		var message Message
 		err := ha.conn.ReadJSON(&message)
 		if err != nil {
@@ -102,7 +104,7 @@ func (ha *Connection) connectAndAuthenticate() error {
 			}
 
 		}
-
+		log.Printf("%+v", message)
 		switch message.Type {
 		case "auth_required":
 			var message = struct {
